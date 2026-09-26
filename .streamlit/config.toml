@@ -1,2 +1,6 @@
 [theme]
 base = "light"
+primaryColor = "#235213"
+
+[client]
+toolbarMode = "viewer"
