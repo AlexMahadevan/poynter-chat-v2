@@ -59,6 +59,21 @@ streamlit run app.py
 
 The app opens at `http://localhost:8501`.
 
+## Deploying to Fly.io
+
+The app runs on Fly.io as a Docker container, with one machine kept running at all times so it never has to wake up. The config is in `fly.toml` and `Dockerfile`.
+
+Set the secrets once:
+
+```bash
+fly secrets set ANTHROPIC_API_KEY=... LD_USERNAME=ld_api_read LD_APP_PASSWORD=... \
+  QDRANT_URL=... QDRANT_API_KEY=... \
+  GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... \
+  REDIRECT_URI=https://poynter-teaching-assistant.fly.dev
+```
+
+Then deploy with `fly deploy`. The Google OAuth client must list the `REDIRECT_URI` value as an authorized redirect URI.
+
 ## Files to keep out of git
 
 Make sure your `.gitignore` includes:

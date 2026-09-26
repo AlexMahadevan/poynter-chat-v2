@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+env
+__pycache__
+*.pyc
+.env
+token.json
+credentials.json
+google_auth_credentials.json
+streamlit_secrets.toml
+documents.json
+auditor.json
+data
+.DS_Store
