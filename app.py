@@ -16,7 +16,7 @@ from curl_cffi import requests as cffi_requests
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, PointIdsList, PayloadSchemaType
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 try:
     from googleapiclient.discovery import build
@@ -34,7 +34,10 @@ LD_BASE_URL = "https://www.poynter.org"
 LD_USERNAME = os.environ.get("LD_USERNAME", "ld_api_read")
 LD_APP_PASSWORD = os.environ.get("LD_APP_PASSWORD", "")
 LD_AUTH = (LD_USERNAME, LD_APP_PASSWORD)
-MODEL = "claude-sonnet-4-6"
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
+MAX_OUTPUT_TOKENS = 16000
+MAX_TOOL_ROUNDS = 12
+DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 DOCS_FILE = os.path.join(os.path.dirname(__file__), "documents.json")
 AUDITOR_FILE = os.path.join(os.path.dirname(__file__), "auditor.json")
 AUDIT_PAGE_SIZE = 25
@@ -269,7 +272,7 @@ def fetch_all_courses_cached():
 def run_course_audit(course_id: str, course_title: str) -> dict:
     structure = tool_get_course_structure(int(course_id))
     lessons = tool_list_lessons(int(course_id))
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = get_anthropic()
     prompt = f"""Audit this Poynter online journalism course and return a structured JSON report.
 
 Course: {course_title}
@@ -300,7 +303,8 @@ Flag Outdated if content references tools, platforms, or statistics that appear 
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
     )
-    text = resp.content[0].text.strip()
+    # The model may return thinking blocks before the text, so pick the text blocks
+    text = "".join(b.text for b in resp.content if b.type == "text").strip()
     text = re.sub(r"^```[a-z]*\n?", "", text)
     text = re.sub(r"\n?```$", "", text)
     try:
@@ -321,23 +325,25 @@ SYSTEM_PROMPT = """You are a focused assistant for Poynter's teaching team — s
 You are ONLY here to help with:
 - Finding and analyzing content in Poynter's LMS course catalog
 - Searching and reading files in the team's Google Drive
+- Finding and reading Poynter.org articles to support teaching and course material
 - Course development, content planning, and course auditing
 - Questions directly related to Poynter's teaching programs and curriculum
 
 If asked about anything outside this scope (general knowledge, current events, coding help, creative writing, personal advice, or any topic unrelated to Poynter's courses and content), politely decline. Explain that you're focused on Poynter's content library, and suggest they use a general-purpose AI assistant for other needs.
 
-You have access to Poynter's full LearnDash course catalog AND the team's Google Drive.
+You have access to Poynter's full LearnDash course catalog, the team's Google Drive, and the articles published on Poynter.org.
 
 Respond in whatever format best fits the question. A broad question gets an overview.
 A specific content question gets a detailed breakdown. A review request gets structured feedback with specific quotes and suggestions.
 
 When finding content on a topic: ALWAYS call search_all first — it searches every enabled
-source (LMS and Drive) in parallel. Never skip Drive when it is enabled.
+source (LMS, Drive and Poynter.org articles) in parallel. Never skip Drive when it is enabled.
 
 For comprehensive questions (e.g. "show me everything on X", "evaluate consistency across content"):
 - Call search_all multiple times with different phrasings of the topic to maximize coverage
 - After identifying relevant LMS lessons or topics, call get_lesson or get_topic to read full text
 - After identifying relevant Drive files, call read_drive_file on each to read actual content
+- After identifying relevant Poynter.org articles, call get_article to read them
 - Do not summarize or draw conclusions based only on titles — always read the content first
 
 For LMS navigation: use search_courses when looking for a specific course by name.
@@ -345,7 +351,22 @@ Drill into results with get_course_structure, list_lessons, or list_topics as ne
 
 Always include direct links to any course, lesson, topic, or Drive file you reference.
 Links are provided in the tool results. Format them as markdown links, e.g. [Title](https://...).
-Never construct or guess a URL — only use URLs that appear verbatim in tool results."""
+Never construct or guess a URL — only use URLs that appear verbatim in tool results.
+
+Keep tool use proportionate. A simple lookup needs one or two searches; stop searching once you have enough to answer well."""
+
+MODE_PROMPTS = {
+    "explore": """
+
+You are in Explore Content mode. The user wants to find what Poynter already has. Lead with the most relevant items, group them by source, and say in a sentence why each one fits the request. If coverage is thin or missing, say so plainly, because a gap in the catalog is useful information.""",
+    "develop": """
+
+You are in Course Development mode. The user is building or revising a course, lesson or workshop. Act as an instructional design partner:
+- Before drafting anything new, search for what Poynter already teaches on the topic so the new material builds on it and doesn't duplicate it. Name the existing lessons and articles you drew on, with links.
+- When asked for a course or lesson plan, include measurable learning objectives, a module-by-module outline, activities or exercises, and a way to assess learning.
+- When asked to revise existing material, quote the passage you are changing and explain why.
+- Write drafts that faculty can paste straight into a lesson, in plain language suited to working journalists.""",
+}
 
 QDRANT_URL = os.environ.get("QDRANT_URL", "")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
@@ -384,16 +405,27 @@ def _ensure_collections():
 
 
 @st.cache_resource
+def get_anthropic():
+    # Explicit timeout so a stalled request fails in minutes instead of hanging the page
+    return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=180.0, max_retries=3)
+
+
+@st.cache_resource
 def load_search_models():
-    dense = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-    return dense, qdrant
+    # fastembed runs the same all-MiniLM-L6-v2 model on ONNX, which avoids loading
+    # PyTorch at startup and makes cold starts much faster
+    dense = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+    return dense, get_qdrant()
+
+
+def embed_query(model, text: str) -> list:
+    return next(iter(model.embed([text]))).tolist()
 
 
 # --- LearnDash API ---
 
-def ld_get(path, params=None):
-    url = f"{LD_BASE_URL}/wp-json/ldlms/v2/{path}"
+def ld_get(path, params=None, namespace="ldlms/v2"):
+    url = f"{LD_BASE_URL}/wp-json/{namespace}/{path}"
     resp = cffi_requests.get(url, auth=LD_AUTH, params=params or {}, timeout=15, impersonate="chrome")
     resp.raise_for_status()
     return resp.json(), resp.headers
@@ -432,7 +464,7 @@ def tool_search_content(query: str) -> str:
     # Semantic search via Qdrant
     try:
         dense_model, qdrant = load_search_models()
-        dense_vec = dense_model.encode(query).tolist()
+        dense_vec = embed_query(dense_model, query)
         results = qdrant.query_points(
             collection_name=QDRANT_COLLECTION,
             query=dense_vec,
@@ -620,6 +652,48 @@ def tool_get_topic(topic_id: int) -> str:
         return f"{header}\n\n{content}"
     except Exception as e:
         return f"Error getting topic: {e}"
+
+
+# --- Poynter.org articles (standard WordPress posts API) ---
+
+def tool_search_articles(query: str, date_from=None, date_to=None) -> str:
+    params = {
+        "search": query,
+        "per_page": 15,
+        "orderby": "relevance",
+        "_fields": "id,title,link,date,excerpt",
+    }
+    if date_from:
+        params["after"] = f"{date_from.isoformat()}T00:00:00"
+    if date_to:
+        params["before"] = f"{date_to.isoformat()}T23:59:59"
+    try:
+        posts, _ = ld_get("posts", params, namespace="wp/v2")
+        if not posts:
+            return f"No Poynter.org articles found matching '{query}'."
+        lines = [f"Poynter.org articles matching '{query}':\n"]
+        for p in posts:
+            title = strip_html(p.get("title", {}).get("rendered", "(no title)"))
+            published = p.get("date", "")[:10]
+            snippet = strip_html(p.get("excerpt", {}).get("rendered", ""))[:160]
+            line = f"- [ARTICLE ID {p['id']}, {published}] {title} — URL: {p.get('link', '')}"
+            if snippet:
+                line += f" | {snippet}"
+            lines.append(line)
+        lines.append("\nUse get_article with an article ID to read the full text.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Poynter.org article search error: {e}"
+
+
+def tool_get_article(article_id: int) -> str:
+    try:
+        data, _ = ld_get(f"posts/{article_id}", {"_fields": "title,link,date,content"}, namespace="wp/v2")
+        title = strip_html(data.get("title", {}).get("rendered", "(no title)"))
+        content = strip_html(data.get("content", {}).get("rendered", "(no content)"))
+        return f"Article: {title}\nPublished: {data.get('date', '')[:10]}\nURL: {data.get('link', '')}\n\n{content}"
+    except Exception as e:
+        return f"Error getting article: {e}"
 
 
 def get_drive_credentials():
@@ -839,6 +913,7 @@ def tool_search_all(query: str, context: dict = None) -> str:
     ctx = context or {}
     src_lms = ctx.get("src_lms", st.session_state.get("src_lms", True))
     src_drive = ctx.get("src_drive", st.session_state.get("src_drive", True))
+    src_articles = ctx.get("src_articles", st.session_state.get("src_articles", True))
     access_token = ctx.get("access_token", "")
     drive_types = ctx.get("drive_types", ["Docs", "Slides", "Sheets"])
     date_from = ctx.get("date_from")
@@ -850,12 +925,16 @@ def tool_search_all(query: str, context: dict = None) -> str:
             futures["lms"] = executor.submit(tool_search_content, query)
         if src_drive:
             futures["drive"] = executor.submit(tool_search_drive, query, access_token, drive_types, date_from, date_to)
+        if src_articles:
+            futures["articles"] = executor.submit(tool_search_articles, query, date_from, date_to)
 
     parts = []
     if "lms" in futures:
         parts.append("**📚 Course Content**\n" + futures["lms"].result())
     if "drive" in futures:
         parts.append("**📁 Team Resources**\n" + futures["drive"].result())
+    if "articles" in futures:
+        parts.append("**📰 Poynter.org Articles**\n" + futures["articles"].result())
 
     return "\n\n".join(parts) if parts else "No search sources are enabled."
 
@@ -882,6 +961,10 @@ def execute_tool(name: str, inputs: dict, context: dict = None) -> str:
         return tool_search_all(inputs["query"], ctx)
     elif name == "read_drive_file":
         return tool_read_drive_file(inputs["file_id"], ctx.get("access_token", ""))
+    elif name == "search_articles":
+        return tool_search_articles(inputs["query"], ctx.get("date_from"), ctx.get("date_to"))
+    elif name == "get_article":
+        return tool_get_article(inputs["article_id"])
     return f"Unknown tool: {name}"
 
 
@@ -899,9 +982,30 @@ READ_DRIVE_FILE_TOOL = {
     },
 }
 
+ARTICLE_TOOLS = [
+    {
+        "name": "search_articles",
+        "description": "Search Poynter.org articles only, by keyword. Use for extra phrasings after search_all, or when the user asks specifically for articles, reporting or commentary from Poynter.org.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Keywords to search for"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_article",
+        "description": "Get the full text of a Poynter.org article by its ID. Read an article before quoting, summarizing or recommending it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"article_id": {"type": "integer", "description": "The article ID from search results"}},
+            "required": ["article_id"],
+        },
+    },
+]
+
 SEARCH_ALL_TOOL = {
     "name": "search_all",
-    "description": "Search all active sources (Poynter LMS and/or Google Drive) for a topic. Always call this for any topic-based question — it automatically searches every enabled source in parallel.",
+    "description": "Search all active sources (Poynter LMS, Google Drive and Poynter.org articles) for a topic. Always call this for any topic-based question — it automatically searches every enabled source in parallel.",
     "input_schema": {
         "type": "object",
         "properties": {"query": {"type": "string", "description": "Topic or concept to search for"}},
@@ -978,11 +1082,14 @@ LMS_NAV_TOOLS = [
 def get_active_tools():
     src_lms = st.session_state.get("src_lms", True)
     src_drive = st.session_state.get("src_drive", True)
+    src_articles = st.session_state.get("src_articles", True)
     tools = []
-    if src_lms or src_drive:
+    if src_lms or src_drive or src_articles:
         tools.append(SEARCH_ALL_TOOL)
     if src_drive:
         tools.append(READ_DRIVE_FILE_TOOL)
+    if src_articles:
+        tools.extend(ARTICLE_TOOLS)
     if src_lms:
         tools.extend(LMS_NAV_TOOLS)
     return tools
@@ -991,12 +1098,13 @@ def get_active_tools():
 def build_filter_system_addendum():
     src_lms = st.session_state.get("src_lms", True)
     src_drive = st.session_state.get("src_drive", True)
+    src_articles = st.session_state.get("src_articles", True)
 
-    if not src_lms and not src_drive:
+    if not src_lms and not src_drive and not src_articles:
         return "\n\nNo search sources are currently enabled. Tell the user they need to enable at least one source in the filters."
 
     lines = []
-    active = [s for s, on in [("Poynter LMS", src_lms), ("Google Drive", src_drive)] if on]
+    active = [s for s, on in [("Poynter LMS", src_lms), ("Google Drive", src_drive), ("Poynter.org articles", src_articles)] if on]
     lines.append(f"Active search sources: {', '.join(active)}.")
 
     if src_drive:
@@ -1018,6 +1126,8 @@ def build_filter_system_addendum():
         lines.append("Do NOT use any LMS navigation tools.")
     if not src_drive:
         lines.append("Do NOT search Google Drive.")
+    if not src_articles:
+        lines.append("Do NOT search Poynter.org articles.")
     if src_drive:
         lines.append("Google Drive is enabled — every search_all call MUST include Drive results. After getting Drive results, use read_drive_file to read the content of relevant files before responding.")
 
@@ -1027,74 +1137,140 @@ def build_filter_system_addendum():
 # --- Claude conversation loop (streaming) ---
 
 TOOL_LABELS = {
-    "search_all": "Searching all sources...",
-    "search_content": "Searching course content...",
-    "search_courses": "Searching courses...",
-    "list_courses": "Loading course catalog...",
-    "get_course_structure": "Loading course structure...",
-    "list_lessons": "Loading lessons...",
-    "list_topics": "Loading topics...",
-    "get_lesson": "Loading lesson...",
-    "get_topic": "Loading topic...",
-    "search_drive": "Searching Google Drive...",
+    "search_all": "Searching all sources",
+    "search_content": "Searching course content",
+    "search_courses": "Searching courses",
+    "search_articles": "Searching Poynter.org articles",
+    "get_article": "Reading an article",
+    "list_courses": "Loading the course catalog",
+    "get_course_structure": "Loading course structure",
+    "list_lessons": "Loading lessons",
+    "list_topics": "Loading topics",
+    "get_lesson": "Reading a lesson",
+    "get_topic": "Reading a topic",
+    "read_drive_file": "Reading a Drive file",
 }
 
 
-def run_claude_streaming(messages: list, placeholder, active_tools: list, system_addendum: str = "") -> str:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+def describe_tool_call(block) -> str:
+    label = TOOL_LABELS.get(block.name, f"Running {block.name}")
+    query = (block.input or {}).get("query")
+    return f'{label} for "{query}"' if query else label
+
+
+def run_tool_safely(name: str, inputs: dict, context: dict) -> tuple:
+    try:
+        return execute_tool(name, inputs, context), False
+    except Exception as e:
+        return f"Tool {name} failed: {e}", True
+
+
+def run_claude_streaming(messages: list, placeholder, active_tools: list, system_addendum: str = "", mode: str = "explore") -> dict:
+    """Run one assistant turn, including any tool calls.
+
+    Returns {"content": final answer text, "steps": list of tool activity lines}.
+    Text the model writes before a tool call ("Let me search...") goes into the
+    activity panel, not the answer, so the answer only shows the final response.
+    """
+    client = get_anthropic()
     api_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
 
-    system_text = SYSTEM_PROMPT + system_addendum
-    cached_system = [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}]
+    # Stable part first so it caches; the filter addendum changes with the sidebar
+    cached_system = [
+        {"type": "text", "text": SYSTEM_PROMPT + MODE_PROMPTS.get(mode, ""), "cache_control": {"type": "ephemeral"}},
+    ]
+    if system_addendum.strip():
+        cached_system.append({"type": "text", "text": system_addendum.strip()})
 
     if active_tools:
         cached_tools = active_tools[:-1] + [{**active_tools[-1], "cache_control": {"type": "ephemeral"}}]
     else:
         cached_tools = []
 
-    full_text = ""
+    tool_context = {
+        "src_lms": st.session_state.get("src_lms", True),
+        "src_drive": st.session_state.get("src_drive", True),
+        "src_articles": st.session_state.get("src_articles", True),
+        "access_token": st.session_state.get("google_access_token", ""),
+        "drive_types": st.session_state.get("drive_types_select", ["Docs", "Slides", "Sheets"]),
+        "date_from": st.session_state.get("date_from"),
+        "date_to": st.session_state.get("date_to"),
+    }
 
-    while True:
-        kwargs = dict(model=MODEL, max_tokens=4096, system=cached_system, messages=api_messages)
+    box = placeholder.container()
+    status = box.status("Thinking…", expanded=False)
+    text_ph = box.empty()
+    steps = []
+    round_text = ""
+
+    def finish(content: str, note: str = "", state: str = "complete") -> dict:
+        if note:
+            content = (content.rstrip() + "\n\n" if content.strip() else "") + f"_{note}_"
+        label = f"Checked {len(steps)} step{'s' if len(steps) != 1 else ''}" if steps else "Done"
+        status.update(label=label, state=state, expanded=False)
+        return {"content": content, "steps": steps}
+
+    for round_num in range(MAX_TOOL_ROUNDS + 1):
+        kwargs = dict(model=MODEL, max_tokens=MAX_OUTPUT_TOKENS, system=cached_system, messages=api_messages)
         if cached_tools:
             kwargs["tools"] = cached_tools
+            if round_num == MAX_TOOL_ROUNDS:
+                # Out of tool rounds: make the model answer with what it has
+                kwargs["tool_choice"] = {"type": "none"}
 
-        with client.messages.stream(**kwargs) as stream:
-            for text in stream.text_stream:
-                full_text += text
-                placeholder.markdown(full_text + "▌")
-            final = stream.get_final_message()
-
-        if final.stop_reason == "end_turn":
-            return full_text
+        round_text = ""
+        try:
+            with client.messages.stream(**kwargs) as stream:
+                for text in stream.text_stream:
+                    round_text += text
+                    text_ph.markdown(round_text + "▌")
+                final = stream.get_final_message()
+        except anthropic.APITimeoutError:
+            return finish(round_text, "The request timed out. Try again, or ask a narrower question.", "error")
+        except anthropic.RateLimitError:
+            return finish(round_text, "The assistant is busy right now. Wait a minute and try again.", "error")
+        except anthropic.APIStatusError as e:
+            return finish(round_text, f"The AI service returned an error ({e.status_code}). Try again in a moment.", "error")
+        except anthropic.APIConnectionError:
+            return finish(round_text, "Couldn't reach the AI service. Check your connection and try again.", "error")
 
         if final.stop_reason == "tool_use":
             tool_blocks = [b for b in final.content if b.type == "tool_use"]
-            labels = [TOOL_LABELS.get(b.name, f"Running {b.name}...") for b in tool_blocks]
-            status = " · ".join(f"*{l}*" for l in labels)
-            placeholder.markdown((full_text + f"\n\n{status}") if full_text else status)
+            if round_text.strip():
+                steps.append(round_text.strip())
+            text_ph.empty()
+            for b in tool_blocks:
+                line = describe_tool_call(b)
+                steps.append(line)
+                status.write(line)
+            status.update(label=describe_tool_call(tool_blocks[-1]) + "…")
 
-            tool_context = {
-                "src_lms": st.session_state.get("src_lms", True),
-                "src_drive": st.session_state.get("src_drive", True),
-                "access_token": st.session_state.get("google_access_token", ""),
-                "drive_types": st.session_state.get("drive_types_select", ["Docs", "Slides", "Sheets"]),
-                "date_from": st.session_state.get("date_from"),
-                "date_to": st.session_state.get("date_to"),
-            }
-            tool_results_map = {}
+            results_map = {}
             with ThreadPoolExecutor() as executor:
-                futures = {executor.submit(execute_tool, b.name, b.input, tool_context): b.id for b in tool_blocks}
+                futures = {executor.submit(run_tool_safely, b.name, b.input, tool_context): b.id for b in tool_blocks}
                 for future in as_completed(futures):
-                    tool_results_map[futures[future]] = future.result()
+                    results_map[futures[future]] = future.result()
 
-            tool_results = [
-                {"type": "tool_result", "tool_use_id": b.id, "content": tool_results_map[b.id]}
-                for b in tool_blocks
-            ]
+            tool_results = []
+            for b in tool_blocks:
+                content, is_error = results_map[b.id]
+                result = {"type": "tool_result", "tool_use_id": b.id, "content": content}
+                if is_error:
+                    result["is_error"] = True
+                tool_results.append(result)
 
             api_messages.append({"role": "assistant", "content": final.content})
             api_messages.append({"role": "user", "content": tool_results})
+            continue
+
+        if final.stop_reason == "max_tokens":
+            return finish(round_text, "This response hit the length limit. Ask me to continue and I'll pick up where I left off.")
+        if final.stop_reason == "refusal":
+            return finish(round_text, "The assistant declined to answer this request.")
+        # end_turn, stop_sequence and anything else end the turn
+        return finish(round_text)
+
+    return finish(round_text, "Stopped after too many search steps. Try a more specific question.")
 
 
 # --- Streamlit UI ---
@@ -1512,6 +1688,32 @@ hr { border-color: #e4e4e4; }
     color: #888888 !important;
     margin: 0 0 2px 0 !important;
 }
+[data-testid="stButtonGroup"] button {
+    font-family: 'Roboto', sans-serif !important;
+    font-weight: 500 !important;
+    border-color: #cccccc !important;
+    background-color: #ffffff !important;
+    color: #444444 !important;
+}
+[data-testid="stButtonGroup"] button[kind="segmented_controlActive"],
+[data-testid="stButtonGroup"] [data-selected="true"],
+[data-testid="stButtonGroup"] [aria-checked="true"],
+[data-testid="stButtonGroup"] [aria-pressed="true"] {
+    background-color: #235213 !important;
+    border-color: #235213 !important;
+    color: #ffffff !important;
+}
+[data-testid="stButtonGroup"] button[kind="segmented_controlActive"] p,
+[data-testid="stButtonGroup"] [data-selected="true"] p,
+[data-testid="stButtonGroup"] [aria-checked="true"] p,
+[data-testid="stButtonGroup"] [aria-pressed="true"] p {
+    color: #ffffff !important;
+}
+[data-testid="stExpander"] summary p {
+    font-family: 'Roboto', sans-serif !important;
+    font-size: 13px !important;
+    color: #555555 !important;
+}
 """
 
 st.markdown(f"<style>{_CSS}</style>", unsafe_allow_html=True)
@@ -1574,6 +1776,8 @@ for key, default in [
     ("renaming_doc", None),
     ("src_lms", True),
     ("src_drive", True),
+    ("src_articles", True),
+    ("main_view", "Explore Content"),
     ("drive_types_select", ["Docs", "Slides", "Sheets"]),
     ("date_from", None),
     ("date_to", None),
@@ -1621,6 +1825,7 @@ with st.sidebar:
     st.markdown('<p class="filter-heading">Search Sources</p>', unsafe_allow_html=True)
     st.checkbox("Poynter LMS", key="src_lms")
     st.checkbox("Google Drive", key="src_drive")
+    st.checkbox("Poynter.org articles", key="src_articles")
     st.markdown('<p class="filter-heading" style="margin-top:10px">Drive File Types</p>', unsafe_allow_html=True)
     st.multiselect(
         "drive_types_label",
@@ -1719,15 +1924,44 @@ def confirm_new_search(messages_key: str):
         st.rerun()
 
 
-def render_chat(messages_key: str, welcome: str, placeholder_text: str):
+STARTER_PROMPTS = {
+    "explore": [
+        "What do we teach about verifying images and video?",
+        "Find everything we have on AI ethics in newsrooms",
+        "Which lessons and articles cover interviewing techniques?",
+        "What Poynter.org articles would pair well with our fact-checking course?",
+    ],
+    "develop": [
+        "Draft a 4-module course outline on covering local elections",
+        "Write learning objectives for a lesson on AI-assisted research",
+        "Design a hands-on exercise for a workshop on source verification",
+        "What's missing from our catalog on audience engagement?",
+    ],
+}
+
+
+def respond(messages: list, mode: str):
+    with st.chat_message("assistant"):
+        reply_placeholder = st.empty()
+        reply = run_claude_streaming(messages, reply_placeholder, get_active_tools(), build_filter_system_addendum(), mode)
+        render_md(reply["content"], reply_placeholder)
+    messages.append({"role": "assistant", "content": reply["content"], "steps": reply["steps"]})
+
+
+def render_chat(messages_key: str, welcome: str, placeholder_text: str, mode: str):
     messages = st.session_state[messages_key]
-    active_tools = get_active_tools()
-    system_addendum = build_filter_system_addendum()
     editing_key = f"editing_msg_{messages_key}"
     pending_key = f"pending_response_{messages_key}"
 
     if not messages:
         st.markdown(f'<div class="welcome-text">{welcome}</div>', unsafe_allow_html=True)
+        st.caption("Try one of these, or type your own question below.")
+        cols = st.columns(2)
+        for n, starter in enumerate(STARTER_PROMPTS.get(mode, [])):
+            if cols[n % 2].button(starter, key=f"{messages_key}_starter_{n}", use_container_width=True):
+                messages.append({"role": "user", "content": starter})
+                st.session_state[pending_key] = True
+                st.rerun()
 
     for i, msg in enumerate(messages):
         with st.chat_message(msg["role"]):
@@ -1749,6 +1983,10 @@ def render_chat(messages_key: str, welcome: str, placeholder_text: str):
                     st.session_state[editing_key] = None
                     st.rerun()
             else:
+                if msg["role"] == "assistant" and msg.get("steps"):
+                    with st.expander(f"How I found this ({len(msg['steps'])} steps)", expanded=False):
+                        for step in msg["steps"]:
+                            st.markdown(f"- {step}")
                 render_md(msg["content"])
                 if msg["role"] == "user":
                     if st.button("Edit prompt", key=f"edit_btn_{messages_key}_{i}"):
@@ -1756,36 +1994,30 @@ def render_chat(messages_key: str, welcome: str, placeholder_text: str):
                         st.rerun()
 
         if msg["role"] == "assistant":
-            with st.expander("Debug: raw response", expanded=False):
-                st.code(msg["content"], language=None)
+            if DEBUG:
+                with st.expander("Debug: raw response", expanded=False):
+                    st.code(msg["content"], language=None)
             if st.button("Save as Doc", key=f"{messages_key}_save_{i}"):
                 save_as_document(msg["content"])
                 st.rerun()
 
     if st.session_state.get(pending_key) and messages and messages[-1]["role"] == "user":
         st.session_state[pending_key] = False
-        with st.chat_message("assistant"):
-            reply_placeholder = st.empty()
-            reply = run_claude_streaming(messages, reply_placeholder, active_tools, system_addendum)
-            render_md(reply, reply_placeholder)
-        messages.append({"role": "assistant", "content": reply})
+        respond(messages, mode)
         st.rerun()
 
-    if prompt := st.chat_input(placeholder_text):
+    if messages:
+        with st.container():
+            st.markdown('<span class="clear-search-marker"></span>', unsafe_allow_html=True)
+            if st.button("Clear Search", key=f"{messages_key}_new_search"):
+                confirm_new_search(messages_key)
+
+    if prompt := st.chat_input(placeholder_text, key=f"{messages_key}_input"):
         messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             render_md(prompt)
-        with st.chat_message("assistant"):
-            reply_placeholder = st.empty()
-            reply = run_claude_streaming(messages, reply_placeholder, active_tools, system_addendum)
-            render_md(reply, reply_placeholder)
-        messages.append({"role": "assistant", "content": reply})
+        respond(messages, mode)
         st.rerun()
-
-    with st.container():
-        st.markdown('<span class="clear-search-marker"></span>', unsafe_allow_html=True)
-        if st.button("Clear Search", key=f"{messages_key}_new_search"):
-            confirm_new_search(messages_key)
 
 
 # --- Course Auditor UI ---
@@ -2155,23 +2387,27 @@ def render_auditor():
                                 st.rerun()
 
 
-# --- Tabs ---
+# --- Views ---
+# A segmented control instead of st.tabs: st.tabs renders every tab on every rerun,
+# which made each page load fetch the whole LearnDash catalog for the Auditor.
+# Only the selected view runs here.
 
-tab1, tab2, tab3 = st.tabs(["Explore Content", "Course Development", "Course Auditor"])
+VIEWS = ["Explore Content", "Course Development", "Course Auditor"]
+view = st.segmented_control("View", VIEWS, key="main_view", label_visibility="collapsed") or VIEWS[0]
 
-with tab1:
+if view == "Explore Content":
     render_chat(
         messages_key="explore_messages",
         welcome="What content are you looking for today?",
-        placeholder_text="What content are you looking for today?",
+        placeholder_text="Ask about any topic in our courses, Drive or Poynter.org",
+        mode="explore",
     )
-
-with tab2:
+elif view == "Course Development":
     render_chat(
         messages_key="dev_messages",
         welcome="What are we working on today?",
-        placeholder_text="What are we working on today?",
+        placeholder_text="Describe the course, lesson or exercise you're building",
+        mode="develop",
     )
-
-with tab3:
+else:
     render_auditor()

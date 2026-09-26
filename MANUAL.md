@@ -2,7 +2,7 @@
 
 ## What This Tool Does
 
-The Poynter Teaching Assistant is an AI-powered research and planning tool for Poynter's teaching team. It connects directly to two content sources — the Poynter LearnDash LMS and your Google Drive — and lets you search, analyze, and evaluate content using natural language.
+The Poynter Teaching Assistant is an AI-powered research and planning tool for Poynter's teaching team. It connects directly to three content sources — the Poynter LearnDash LMS, your Google Drive and the articles published on Poynter.org — and lets you search, analyze, and evaluate content using natural language.
 
 **Core capabilities:**
 - Find existing LMS courses, lessons, and topics by topic, keyword, or concept
@@ -39,17 +39,18 @@ The sidebar is visible on every tab and has two functions:
 
 ## The Filter Bar
 
-The filter bar sits above all three tabs and controls what sources are searched.
+The filters in the sidebar apply to every view and controls what sources are searched.
 
 **Search sources:**
 - **Poynter LMS** — searches the full LearnDash course catalog using both semantic (meaning-based) and keyword search
 - **Google Drive** — searches your Drive and shared files for documents, slide decks, and sheets
+- **Poynter.org articles** — searches everything published on Poynter.org, so you can pair course material with current reporting and commentary
 
-Both are on by default. You can turn either off to limit results to one source.
+All three are on by default. You can turn any of them off to limit results.
 
 **Drive File Types:** When Drive is enabled, you can restrict results to specific file types: Docs, Slides, Sheets, Forms, or Images. All are included by default.
 
-**Date Range:** Narrows Drive results to files modified within a specific date range. Useful when looking for recently updated materials.
+**Date Range:** Narrows Drive results to files modified within a specific date range, and Poynter.org results to articles published within it. Useful when looking for recently updated materials.
 
 ---
 
@@ -90,7 +91,7 @@ The assistant searches both sources automatically and reads the actual text of w
 
 A general-purpose AI workspace for course development tasks. Use this tab when you're actively building or revising a course rather than exploring existing content.
 
-The same LMS and Drive search tools are available here. The distinction from Explore Content is intent — this tab is for generative, iterative work.
+The same search tools are available here, but the assistant works as an instructional design partner. It checks what Poynter already teaches before drafting, writes measurable learning objectives, and builds outlines, activities and assessments you can paste into a lesson.
 
 ### Best Practices
 
@@ -156,4 +157,6 @@ Use the ↑ and ↓ buttons on each card to move courses between priority lanes.
 - **Drive search covers your personal Drive and files shared with you.** It does not yet cover all of Poynter's shared drives unless those files have been shared with your account.
 - **Drive tokens expire after about an hour.** If Drive search stops working mid-session, sign out and back in to refresh.
 - **Documents are per-user.** Your saved documents are only visible to you. Audit results are shared across all users.
+- **Each answer shows how it was found.** Open "How I found this" above a response to see which searches the assistant ran and what it read.
+- **Long answers stop cleanly.** If a response hits the length limit, the assistant says so. Ask it to continue.
 - **The assistant reads content deeply for evaluation tasks** — expect it to take 30–60 seconds on complex analysis questions while it fetches and reads multiple sources.

@@ -7,6 +7,7 @@ An AI chat assistant for Poynter's teaching team. Search 8,000+ LearnDash course
 - **Explore Content** — find lessons, topics, and courses on any subject using semantic search (meaning-based, not just keyword matching)
 - **Course Development** — a separate chat context for working on new or existing course material
 - **Google Drive search** — searches team Drive files in parallel with the course catalog
+- **Poynter.org articles** — searches published articles through the WordPress API, using the same credentials as LearnDash
 - **Direct links** — every result includes a clickable link back to the source
 - **Save to Documents** — save any AI response to the built-in document editor, rename it, and download as Markdown
 
@@ -33,6 +34,9 @@ Create a `.env` file in the project root:
 ANTHROPIC_API_KEY=your_key_here
 LD_USERNAME=ld_api_read
 LD_APP_PASSWORD=your_learndash_password_here
+# Optional
+CLAUDE_MODEL=claude-sonnet-5   # model used for chat and audits
+DEBUG=true                      # shows the raw-response expander under each answer
 ```
 
 ### 4. Set up Google Drive (optional)
@@ -72,7 +76,7 @@ documents.json
 |---|---|
 | UI | Streamlit |
 | AI | Claude via Anthropic API |
-| Semantic search | Qdrant + sentence-transformers |
+| Semantic search | Qdrant + fastembed (all-MiniLM-L6-v2) |
 | LMS data | LearnDash REST API |
 | Drive search | Google Drive API v3 |
 
